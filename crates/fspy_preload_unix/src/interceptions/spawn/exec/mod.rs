@@ -30,7 +30,8 @@ pub unsafe fn environ() -> *const *const c_char {
 /// `untracked` performs the interposed call as the caller made it, through
 /// that function's own original: `execvp` keeps its `PATH` search,
 /// `execveat` its `dirfd` and flags, `fexecve` its descriptor. It runs when
-/// the injection machinery fails, so the process still execs, untracked.
+/// this process has no tracking client or the injection machinery fails, so
+/// the process still execs, untracked.
 fn handle_exec(
     allocator: impl Allocator,
     config: ExecResolveConfig,
@@ -39,8 +40,11 @@ fn handle_exec(
     envp: *const *const libc::c_char,
     untracked: impl FnOnce() -> libc::c_int,
 ) -> libc::c_int {
-    let client =
-        global_client().expect("exec unexpectedly called before client initialized in ctor");
+    let Some(client) = global_client() else {
+        // The ctor left the client unset (no readable environment, or no
+        // valid payload): run untracked.
+        return untracked();
+    };
     // SAFETY: prog, argv, and envp are valid pointers to C strings/arrays forwarded from the interposed exec function
     let result = unsafe {
         client.handle_exec(

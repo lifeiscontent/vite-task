@@ -114,3 +114,22 @@ fn execvp_fallback_keeps_path_search() {
         panic!("the channel did not report the untracked exec");
     };
 }
+
+/// A preload loaded without a payload (e.g. a leaked `LD_PRELOAD` in an
+/// env-scrubbed sandbox) must not abort its host process: the constructor
+/// degrades and every exec forwards to the original.
+#[test]
+fn preload_without_payload_runs_untracked() {
+    let output = Command::new("/bin/sh")
+        .arg("-c")
+        .arg("exec /bin/true")
+        .env_clear()
+        .env("LD_PRELOAD", PRELOAD_CDYLIB)
+        .output()
+        .expect("failed to spawn the shell");
+    assert!(
+        output.status.success(),
+        "the preload aborted its host process: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
