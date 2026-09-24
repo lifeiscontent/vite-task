@@ -472,7 +472,7 @@ fn resolve_synthetic_cache_config(
             // Top-level: resolve from synthetic's own config
             Ok(ResolvedTaskOptions::resolve(
                 UserTaskOptions {
-                    cache_config: synthetic_cache_config,
+                    cache_config: Some(synthetic_cache_config),
                     cwd_relative_to_package: None,
                     depends_on: None,
                 },
@@ -486,9 +486,9 @@ fn resolve_synthetic_cache_config(
         ParentCacheConfig::Inherited(mut parent_config) => {
             // Cache is enabled only if both parent and synthetic want it.
             // Merge synthetic's additions into parent's config.
-            Ok(match synthetic_cache_config {
-                UserCacheConfig::Disabled { .. } => Option::None,
-                UserCacheConfig::Enabled { enabled_cache_config, .. } => {
+            Ok(match synthetic_cache_config.into_enabled() {
+                Option::None => Option::None,
+                Some(enabled_cache_config) => {
                     let EnabledCacheConfig { env, untracked_env, input, output } =
                         enabled_cache_config;
                     parent_config.env_config.fingerprinted_envs.extend(env.unwrap_or_default());
