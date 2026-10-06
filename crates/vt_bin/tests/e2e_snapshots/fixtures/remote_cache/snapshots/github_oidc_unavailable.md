@@ -1,19 +1,19 @@
-# unreachable_endpoint
+# github_oidc_unavailable
 
-## `VP_REMOTE_CACHE=read-write VP_REMOTE_CACHE_URL=http://127.0.0.1:0/projects/test VP_RUN_INTERNAL_HIDE_PENDING_UPLOADS=1 vt run build`
+## `VP_REMOTE_CACHE=read-write VP_REMOTE_CACHE_URL=http://127.0.0.1:0/projects/test ACTIONS_ID_TOKEN_REQUEST_URL=http://127.0.0.1:0/token?api-version=2.0 ACTIONS_ID_TOKEN_REQUEST_TOKEN=request-token VP_RUN_INTERNAL_HIDE_PENDING_UPLOADS=1 vt run build`
 
-Nothing can listen on port 0. The failed fetch is the miss reason, and the upload fails in the background with a warning. The task succeeds.
+The job can request GitHub Actions OIDC tokens, so the upload needs one first. Nothing can listen on port 0, so the token request fails, and the upload fails without being sent. The task succeeds.
 
 ```
 $ vtt write-file dist/output.txt built ○ cache miss: remote cache fetch failed, executing
 
 ---
-vt run: remote-cache#build not uploaded to the remote cache: network error. (Run `vt run --last-details` for full details)
+vt run: remote-cache#build not uploaded to the remote cache: failed to authenticate. (Run `vt run --last-details` for full details)
 ```
 
 ## `vt run --last-details`
 
-The details include the underlying error.
+The details include why the token request failed.
 
 ```
 
@@ -33,7 +33,8 @@ Task Details:
         ↳ client error (Connect)
         ↳ tcp connect error
         ↳ <os error>
-      ⚠ Not uploaded to the remote cache: network error
+      ⚠ Not uploaded to the remote cache: failed to authenticate
+        ↳ GitHub Actions OIDC token request failed
         ↳ error sending request
         ↳ client error (Connect)
         ↳ tcp connect error
