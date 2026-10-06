@@ -360,26 +360,12 @@ impl<'a> Session<'a> {
                     stderr: stderr_supports_color(),
                 };
 
-                let inner: Box<dyn reporter::GraphExecutionReporterBuilder> = match run_command
-                    .flags
-                    .log
-                {
-                    crate::cli::LogMode::Interleaved => Box::new(InterleavedReporterBuilder::new(
-                        Arc::clone(&workspace_path),
-                        writer,
-                        color_support,
-                    )),
-                    crate::cli::LogMode::Labeled => Box::new(LabeledReporterBuilder::new(
-                        Arc::clone(&workspace_path),
-                        writer,
-                        color_support,
-                    )),
-                    crate::cli::LogMode::Grouped => Box::new(GroupedReporterBuilder::new(
-                        Arc::clone(&workspace_path),
-                        writer,
-                        color_support,
-                    )),
-                };
+                let inner = log_reporter_builder(
+                    run_command.flags.log,
+                    Arc::clone(&workspace_path),
+                    writer,
+                    color_support,
+                );
 
                 let builder = Box::new(SummaryReporterBuilder::new(
                     inner,
@@ -885,4 +871,24 @@ fn stderr_supports_color() -> bool {
     use std::sync::OnceLock;
     static CACHE: OnceLock<bool> = OnceLock::new();
     *CACHE.get_or_init(|| supports_color::on(supports_color::Stream::Stderr).is_some())
+}
+
+/// Build the reporter for the `--log` mode.
+fn log_reporter_builder(
+    log: crate::cli::LogMode,
+    workspace_path: Arc<AbsolutePath>,
+    writer: Box<dyn std::io::Write>,
+    color_support: ColorSupport,
+) -> Box<dyn reporter::GraphExecutionReporterBuilder> {
+    match log {
+        crate::cli::LogMode::Interleaved => {
+            Box::new(InterleavedReporterBuilder::new(workspace_path, writer, color_support))
+        }
+        crate::cli::LogMode::Labeled => {
+            Box::new(LabeledReporterBuilder::new(workspace_path, writer, color_support))
+        }
+        crate::cli::LogMode::Grouped => {
+            Box::new(GroupedReporterBuilder::new(workspace_path, writer, color_support))
+        }
+    }
 }

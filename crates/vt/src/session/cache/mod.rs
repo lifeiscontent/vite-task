@@ -329,7 +329,11 @@ impl ExecutionCache {
             db_path.as_path(),
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
-        Ok(Some(Self { conn: Mutex::new(conn), remote_clients: RemoteClients::default() }))
+        Ok(Some(Self {
+            conn: Mutex::new(conn),
+            remote_clients: RemoteClients::default(),
+            uploads: RemoteUploads::default(),
+        }))
     }
 
     #[tracing::instrument]
