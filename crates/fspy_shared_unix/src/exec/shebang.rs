@@ -17,12 +17,15 @@ pub struct ParseShebangOptions {
     pub split_arguments: bool, // TODO: recursive
     /// How many bytes of the file the kernel reads to find the shebang line.
     pub max_line_len: usize,
-    /// Whether the line must end with a newline within `max_line_len` bytes.
+    /// Whether the line must end within `max_line_len` bytes.
     ///
-    /// macOS refuses a script without one. Linux accepts it as long as the
-    /// interpreter path is followed by a space or tab, so only the
-    /// arguments can have been cut off.
-    pub require_newline: bool,
+    /// macOS refuses a script whose line doesn't end. Linux accepts it as
+    /// long as the interpreter path is followed by a space or tab, so only
+    /// the arguments can have been cut off.
+    pub require_line_end: bool,
+    /// Whether `#` ends the line like a newline does, as on macOS (`IS_EOL`
+    /// in XNU's `exec_shell_imgact`).
+    pub hash_ends_line: bool,
 }
 
 /// Size of the buffer the macOS kernel reads the shebang line into (`IMG_SHSIZE`).
@@ -33,12 +36,22 @@ const LINUX_MAX_LINE_LEN: usize = 256;
 impl ParseShebangOptions {
     #[must_use]
     pub const fn macos() -> Self {
-        Self { split_arguments: true, max_line_len: MACOS_MAX_LINE_LEN, require_newline: true }
+        Self {
+            split_arguments: true,
+            max_line_len: MACOS_MAX_LINE_LEN,
+            require_line_end: true,
+            hash_ends_line: true,
+        }
     }
 
     #[must_use]
     pub const fn linux() -> Self {
-        Self { split_arguments: false, max_line_len: LINUX_MAX_LINE_LEN, require_newline: false }
+        Self {
+            split_arguments: false,
+            max_line_len: LINUX_MAX_LINE_LEN,
+            require_line_end: false,
+            hash_ends_line: false,
+        }
     }
 }
 
@@ -71,22 +84,23 @@ pub fn parse_shebang(
         return Ok(None);
     };
 
-    let line = if let Some(newline) = line.find_byte(b'\n') {
-        &line[..newline]
-    } else if options.require_newline {
+    let line_ends: &[u8] = if options.hash_ends_line { b"\n#" } else { b"\n" };
+    let line = if let Some(line_end) = line.find_byteset(line_ends) {
+        &line[..line_end]
+    } else if options.require_line_end {
         return Err(nix::Error::ENOEXEC);
     } else if total_read_size < options.max_line_len {
         // The whole file fits in the buffer, so nothing was cut off.
         line
     } else {
         // https://github.com/torvalds/linux/blob/v6.12/fs/binfmt_script.c
-        // Like the kernel, keep the last byte of the buffer as a terminator.
-        let line = &line[..line.len() - 1];
-        // The interpreter path must be followed by a space or tab, or it may be cut off.
+        // The interpreter path must be followed by a space or tab, or it may be
+        // cut off. Like the kernel, look for one in the whole buffer but keep
+        // its last byte as a terminator.
         if !line.iter().skip_while(|ch| is_whitespace(**ch)).any(|ch| is_whitespace(*ch)) {
             return Err(nix::Error::ENOEXEC);
         }
-        line
+        &line[..line.len() - 1]
     };
 
     let line = line.trim_ascii();
@@ -318,6 +332,16 @@ mod tests {
     }
 
     #[test]
+    fn macos_ends_line_at_hash() {
+        // The `#` is past the first 128 bytes and no newline follows within 512.
+        let script =
+            [b"#!/bin/sh -e ".as_slice(), &[b' '; 200], b"# comment", &[b'x'; 400]].concat();
+        let shebang = parse(&script, ParseShebangOptions::macos()).unwrap().unwrap();
+        assert_eq!(shebang.interpreter, "/bin/sh");
+        assert_eq!(shebang.arguments, vec![BString::from("-e")]);
+    }
+
+    #[test]
     fn linux_accepts_line_up_to_256_bytes() {
         // "#!" + 253 bytes + "\n" is exactly 256 bytes.
         let (script, interpreter) = script_with_interpreter_len(253);
@@ -333,6 +357,16 @@ mod tests {
         let shebang = parse(b"#!/bin/sh -e", ParseShebangOptions::linux()).unwrap().unwrap();
         assert_eq!(shebang.interpreter, "/bin/sh");
         assert_eq!(shebang.arguments, vec![BString::from("-e")]);
+    }
+
+    #[test]
+    fn linux_accepts_space_in_last_byte() {
+        // "#!" + 253 bytes + " " fills the 256-byte buffer without a newline.
+        let interpreter = [b"/".as_slice(), &[b'x'; 252]].concat();
+        let script = [b"#!".as_slice(), &interpreter, b" ", &[b'a'; 100]].concat();
+        let shebang = parse(&script, ParseShebangOptions::linux()).unwrap().unwrap();
+        assert_eq!(shebang.interpreter, interpreter);
+        assert!(shebang.arguments.is_empty());
     }
 
     #[test]
