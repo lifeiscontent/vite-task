@@ -63,11 +63,20 @@ async fn spawn_shebang_with_long_interpreter_path() -> anyhow::Result<()> {
     let script_path = script_path.into_os_string().into_string().unwrap();
 
     let accesses = track_fn!(script_path, |script_path: String| {
-        let output = Command::new(&script_path)
-            .stdin(Stdio::null())
-            .output()
-            .expect("Failed to execute shebang script");
-        assert_eq!(output.stdout, b"ok\n", "stderr: {}", String::from_utf8_lossy(&output.stderr));
+        let output = Command::new(&script_path).stdin(Stdio::null()).output();
+        // On macOS, fspy only swaps the arm64e `/bin/sh` for its own shell when
+        // it's run by that path. Through the symlink, dyld refuses to load the
+        // arm64 preload into it where SIP is off (as on CI runners), so only
+        // check there that the whole interpreter path was read.
+        if cfg!(target_os = "linux") {
+            let output = output.expect("Failed to execute shebang script");
+            assert_eq!(
+                output.stdout,
+                b"ok\n",
+                "stderr: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
     })
     .await?;
 
