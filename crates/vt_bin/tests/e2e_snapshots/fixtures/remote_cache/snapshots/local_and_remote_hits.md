@@ -1,6 +1,6 @@
 # local_and_remote_hits
 
-## `VP_REMOTE_CACHE=read-write remote-cache-server vt run build`
+## `VP_REMOTE_CACHE=read-write VP_RUN_INTERNAL_HIDE_PENDING_UPLOADS=1 remote-cache-server vt run build`
 
 ```
 $ vtt write-file dist/output.txt built
@@ -34,7 +34,7 @@ $ vtt print checked ◉ cache hit, replaying
 checked
 
 ---
-vt run: 2/2 cache hit (100%, 1 remote). (Run `vt run --last-details` for full details)
+vt run: 2/2 cache hit (100%, 1 remote), 2/2 successful. (Run `vt run --last-details` for full details)
 [remote-cache] POST /fetch 200 exact
 [remote-cache] GET /blob/1 200
 ```

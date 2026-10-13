@@ -1,4 +1,8 @@
-use std::{process::ExitStatus, time::Duration};
+use std::{
+    process::ExitStatus,
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
 
 use vt_path::RelativePathBuf;
 use vt_server::Error as IpcServerError;
@@ -119,6 +123,7 @@ pub enum CacheNotUpdatedReason {
     /// none for a record that long. The accesses that did arrive are a
     /// subset of what the task touched, so caching from them would bake in
     /// inputs and outputs that are not all of them.
+    #[cfg_attr(not(fspy), expect(dead_code, reason = "only fspy tracking can be incomplete"))]
     TrackingIncomplete,
 }
 
@@ -126,9 +131,13 @@ pub enum CacheNotUpdatedReason {
 pub enum CacheUpdateStatus {
     /// Cache was successfully updated with new fingerprint and outputs
     Updated {
-        /// Why uploading the entry to the remote cache failed. `None` if the
-        /// upload succeeded or wasn't attempted.
-        upload_error: Option<UploadError>,
+        /// Why uploading the entry to the remote cache failed. It's set only
+        /// if the upload fails, which can happen in the background after the
+        /// task finishes. Empty if the upload succeeded or wasn't attempted.
+        /// Read it only after
+        /// [`ExecutionCache::wait_for_uploads`](super::cache::ExecutionCache::wait_for_uploads)
+        /// returns.
+        upload_error: Arc<OnceLock<UploadError>>,
     },
     /// Cache was not updated (with reason).
     /// The reason is part of the `LeafExecutionReporter` trait contract — reporters
