@@ -12,7 +12,7 @@ $ vtt print-file test.txt
 tests
 
 ---
-vt run: 0/2 cache hit (0%). (Run `vt run --last-details` for full details)
+vt run: 0/2 cache hit (0%), 2/2 successful. (Run `vt run --last-details` for full details)
 ```
 
 ## `vtt replace-file-content src.txt source changed`

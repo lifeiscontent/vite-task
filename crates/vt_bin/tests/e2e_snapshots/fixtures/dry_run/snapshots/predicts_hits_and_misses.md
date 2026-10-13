@@ -31,7 +31,7 @@ $ vtt print-file test.txt
 tests
 
 ---
-vt run: 0/2 cache hit (0%). (Run `vt run --last-details` for full details)
+vt run: 0/2 cache hit (0%), 2/2 successful. (Run `vt run --last-details` for full details)
 ```
 
 ## `vt run --dry-run test`
@@ -103,7 +103,7 @@ $ vtt print-file test.txt ◉ cache hit, replaying
 tests
 
 ---
-vt run: 1/2 cache hit (50%). (Run `vt run --last-details` for full details)
+vt run: 1/2 cache hit (50%), 2/2 successful. (Run `vt run --last-details` for full details)
 ```
 
 ## `vt run --dry-run test`
