@@ -3,6 +3,7 @@ pub mod fingerprint;
 pub mod glob;
 mod hash;
 pub mod pipe;
+mod redact;
 mod scheduler;
 pub mod spawn;
 #[cfg(fspy)]
@@ -106,6 +107,7 @@ type IpcDriver = LocalBoxFuture<'static, Result<Recorder, vt_server::Error>>;
 
 /// fspy path-tracking state, present only when a cached task needs automatic
 /// input or output inference.
+#[cfg_attr(not(fspy), expect(dead_code, reason = "the globs only filter fspy's accesses"))]
 struct FspyTracking<'a> {
     input_negative_globs: PathGlobSet<'a>,
     output_negative_globs: PathGlobSet<'a>,
@@ -339,7 +341,9 @@ impl Report {
 ///
 /// Cancelling `fast_fail_token` kills the process. `cancel_token` must be a
 /// child of `fast_fail_token` that Ctrl-C also cancels: cancelling it stops
-/// remote cache requests and prevents caching.
+/// remote cache lookups and prevents caching. A cached run's upload to the
+/// remote cache runs in the background, and the caller waits for it with
+/// [`ExecutionCache::wait_for_uploads`].
 ///
 /// Every path reports through the single `finish()` below — errors (cache
 /// lookup failure, spawn failure, cache update failure) do not abort the
