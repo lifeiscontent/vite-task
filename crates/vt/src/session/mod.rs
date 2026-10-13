@@ -381,8 +381,11 @@ impl<'a> Session<'a> {
                 ));
                 // Don't let SIGINT/CTRL_C kill the runner. Child tasks receive
                 // the signal directly from the terminal driver and handle it
-                // themselves. Cancelling the interrupt token prevents scheduling
-                // new tasks and caching results of in-flight tasks.
+                // themselves. Cancelling the cancel token prevents scheduling
+                // new tasks and caching results of in-flight tasks, and stops
+                // remote cache lookups. It's a child of the fast-fail token,
+                // so fast-fail cancels it too. Only Ctrl-C cancels the
+                // interrupt token, which cancels remote cache uploads.
                 //
                 // On Windows, an ancestor process (e.g. cargo) may have been
                 // created with CREATE_NEW_PROCESS_GROUP, which sets a per-process
@@ -401,13 +404,17 @@ impl<'a> Session<'a> {
                     }
                     SetConsoleCtrlHandler(None, 0);
                 }
+                let fast_fail_token = tokio_util::sync::CancellationToken::new();
+                let cancel_token = fast_fail_token.child_token();
                 let interrupt_token = tokio_util::sync::CancellationToken::new();
-                let ct = interrupt_token.clone();
+                let ct = cancel_token.clone();
+                let it = interrupt_token.clone();
                 ctrlc::set_handler(move || {
                     ct.cancel();
+                    it.cancel();
                 })?;
 
-                self.execute_graph(graph, builder, interrupt_token)
+                self.execute_graph(graph, builder, fast_fail_token, cancel_token, interrupt_token)
                     .await
                     .map_err(SessionError::EarlyExit)
             }
@@ -537,7 +544,7 @@ impl<'a> Session<'a> {
         let select_result = vt_select::select_list(&mut stdout, &params, mode, |state| {
             let milestone_name =
                 vt_str::format!("task-select:{}:{}", state.query, state.selected_index);
-            pty_terminal_test_client::mark_milestone(&milestone_name);
+            vt_pty_terminal_test_client::mark_milestone(&milestone_name);
         })?;
 
         if matches!(select_result, vt_select::SelectResult::Cancelled) {
@@ -582,6 +589,7 @@ impl<'a> Session<'a> {
             plan_options: PlanOptions {
                 extra_args: run_command.additional_args.clone().into(),
                 cache_override: run_command.flags.cache_override(),
+                remote_cache_mode: run_command.flags.remote_cache.map(Into::into),
                 concurrency_limit: None,
                 parallel: false,
                 // The selector path runs whatever the user picked interactively;
@@ -718,6 +726,8 @@ impl<'a> Session<'a> {
         );
 
         // Execute the spawn directly using the free function, bypassing the graph pipeline
+        let fast_fail_token = tokio_util::sync::CancellationToken::new();
+        let cancel_token = fast_fail_token.child_token();
         let outcome = execute::execute_spawn(
             Box::new(plain_reporter),
             &spawn_execution,
@@ -725,10 +735,13 @@ impl<'a> Session<'a> {
             &self.workspace_path,
             &self.cache_path,
             self.program_name.as_str(),
-            tokio_util::sync::CancellationToken::new(),
-            tokio_util::sync::CancellationToken::new(),
+            fast_fail_token,
+            cancel_token,
         )
         .await;
+        // Nothing interrupts the upload, if any. The plain reporter has no
+        // summary, so it isn't told about the upload or its result.
+        cache.wait_for_uploads(&tokio_util::sync::CancellationToken::new()).await;
         match outcome {
             // Cache hit — no process was spawned, success
             execute::SpawnOutcome::CacheHit => Ok(ExitStatus::SUCCESS),
@@ -743,8 +756,11 @@ impl<'a> Session<'a> {
                 )]
                 Ok(ExitStatus(code.clamp(1, 255) as u8))
             }
-            // Infrastructure error — already reported through the reporter's finish()
-            execute::SpawnOutcome::Failed => Ok(ExitStatus::FAILURE),
+            // Infrastructure error — already reported through the reporter's finish().
+            // Nothing cancels the tokens above, and a cancelled command wouldn't have run.
+            execute::SpawnOutcome::Failed | execute::SpawnOutcome::Cancelled => {
+                Ok(ExitStatus::FAILURE)
+            }
         }
     }
 

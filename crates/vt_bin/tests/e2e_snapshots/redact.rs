@@ -76,6 +76,12 @@ pub fn redact_e2e_output(mut output: String, workspace_root: &str) -> String {
         regex::Regex::new(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}").unwrap();
     output = uuid_regex.replace_all(&output, "<uuid>").into_owned();
 
+    // Redact OS error messages like "Connection refused (os error 111)", which
+    // differ by platform, to "<os error>". They follow ": " in an error chain,
+    // or "↳ " on their own line in the detailed summary.
+    let os_error_regex = regex::Regex::new(r"(: |↳ )[^:\n]* \(os error -?\d+\)").unwrap();
+    output = os_error_regex.replace_all(&output, "${1}<os error>").into_owned();
+
     // Redact durations like "0ns", "123ms" or "1.23s" to "<duration>"
     let duration_regex = regex::Regex::new(r"\d+(\.\d+)?(ns|ms|s)").unwrap();
     output = duration_regex.replace_all(&output, "<duration>").into_owned();
@@ -117,15 +123,6 @@ pub fn redact_e2e_output(mut output: String, workspace_root: &str) -> String {
     // Remove nondeterministic mise warnings from shell startup in cross-platform runners.
     let mise_warning_regex = regex::Regex::new(r"(?m)^mise WARN\s+.*\n?").unwrap();
     output = mise_warning_regex.replace_all(&output, "").into_owned();
-
-    // Remove ^C echo that Unix terminal drivers emit when ETX (0x03) is written
-    // to the PTY. Windows ConPTY does not echo it.
-    {
-        use cow_utils::CowUtils as _;
-        if let Cow::Owned(replaced) = output.as_str().cow_replace("^C", "") {
-            output = replaced;
-        }
-    }
 
     // Sort consecutive diagnostic blocks to handle non-deterministic tool output
     // (e.g., oxlint reports warnings in arbitrary order due to multi-threading).

@@ -1,15 +1,23 @@
-use std::{process::ExitStatus, time::Duration};
+use std::{
+    process::ExitStatus,
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
 
 use vt_path::RelativePathBuf;
 use vt_server::Error as IpcServerError;
+use vt_str::Str;
 
-use super::cache::CacheMiss;
+use super::cache::{CacheHitSource, CacheMiss, remote::UploadError};
 
 /// The cache operation that failed.
 #[derive(Debug)]
 pub enum CacheErrorKind {
     /// Cache lookup (`try_hit`) failed.
     Lookup,
+    /// Restoring the output files of a remote cache hit failed. A local hit
+    /// fails with [`ExecutionError::LocalCacheRestore`] instead.
+    Restore,
     /// Writing the cache entry failed after successful execution.
     Update,
 }
@@ -18,6 +26,7 @@ impl std::fmt::Display for CacheErrorKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Lookup => f.write_str("lookup"),
+            Self::Restore => f.write_str("restore"),
             Self::Update => f.write_str("update"),
         }
     }
@@ -33,6 +42,16 @@ pub enum ExecutionError {
     #[error("Cache {kind} failed")]
     Cache {
         kind: CacheErrorKind,
+        #[source]
+        source: anyhow::Error,
+    },
+
+    /// Restoring the output files of a local cache hit failed. The entry
+    /// stays in the cache, so later runs fail the same way until the cache is
+    /// cleared.
+    #[error("Cache restore failed. Run `{program_name} cache clean` to clear the cache")]
+    LocalCacheRestore {
+        program_name: Str,
         #[source]
         source: anyhow::Error,
     },
@@ -108,13 +127,22 @@ pub enum CacheNotUpdatedReason {
     /// none for a record that long. The accesses that did arrive are a
     /// subset of what the task touched, so caching from them would bake in
     /// inputs and outputs that are not all of them.
+    #[cfg_attr(not(fspy), expect(dead_code, reason = "only fspy tracking can be incomplete"))]
     TrackingIncomplete,
 }
 
 #[derive(Debug)]
 pub enum CacheUpdateStatus {
     /// Cache was successfully updated with new fingerprint and outputs
-    Updated,
+    Updated {
+        /// Why uploading the entry to the remote cache failed. It's set only
+        /// if the upload fails, which can happen in the background after the
+        /// task finishes. Empty if the upload succeeded or wasn't attempted.
+        /// Read it only after
+        /// [`ExecutionCache::wait_for_uploads`](super::cache::ExecutionCache::wait_for_uploads)
+        /// returns.
+        upload_error: Arc<OnceLock<UploadError>>,
+    },
     /// Cache was not updated (with reason).
     /// The reason is part of the `LeafExecutionReporter` trait contract — reporters
     /// can use it for detailed logging, even if current implementations don't.
@@ -129,7 +157,7 @@ pub enum CacheUpdateStatus {
 pub enum CacheStatus {
     Disabled(CacheDisabledReason),
     Miss(CacheMiss),
-    Hit { replayed_duration: Duration },
+    Hit { replayed_duration: Duration, source: CacheHitSource },
 }
 
 /// Convert `ExitStatus` to an i32 exit code.

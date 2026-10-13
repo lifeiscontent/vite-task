@@ -1,11 +1,20 @@
 import { Busboy } from '@fastify/busboy';
 import { decode } from 'cbor2/decoder';
 import { encode } from 'cbor2/encoder';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import { join } from 'node:path';
 
 interface Entry {
-  value: Uint8Array;
+  value: string;
   blob_id: string | null;
+}
+
+/** The contents of `state.json`. Keys and values are hex-encoded. */
+interface State {
+  next_blob_id: number;
+  entries: Record<string, Entry>;
+  associations: Record<string, string>;
 }
 
 class RequestError extends Error {
@@ -21,12 +30,20 @@ function mediaType(value: string | undefined): string {
   return value?.split(';')[0]?.trim().toLowerCase() ?? '';
 }
 
+function toHex(bytes: Uint8Array): string {
+  return Buffer.from(bytes).toString('hex');
+}
+
+function fromHex(hex: string): Uint8Array {
+  // Encode Uint8Array, not a Node Buffer, whose toJSON method would otherwise
+  // turn it into a map.
+  return new Uint8Array(Buffer.from(hex, 'hex'));
+}
+
 function byteFields(body: Uint8Array, names: string[]): Map<string, Uint8Array> {
   let value: unknown;
   try {
-    // Decode from Uint8Array so byte strings stay Uint8Array, not Node Buffers
-    // (whose toJSON method would otherwise turn them into maps when encoded).
-    value = decode(new Uint8Array(body), { preferMap: true, rejectDuplicateKeys: true });
+    value = decode(body, { preferMap: true, rejectDuplicateKeys: true });
   } catch {
     throw new RequestError(400, 'Invalid CBOR');
   }
@@ -36,19 +53,10 @@ function byteFields(body: Uint8Array, names: string[]): Map<string, Uint8Array> 
   return value;
 }
 
-function readBody(request: IncomingMessage, limit: number): Promise<Buffer> {
+function readBody(request: IncomingMessage): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
-    let size = 0;
-    request.on('data', (chunk: Buffer) => {
-      size += chunk.length;
-      if (size > limit) {
-        chunks.length = 0;
-        reject(new RequestError(413, 'Request too large'));
-      } else {
-        chunks.push(chunk);
-      }
-    });
+    request.on('data', (chunk: Buffer) => chunks.push(chunk));
     request.on('end', () => resolve(Buffer.concat(chunks)));
     request.on('error', reject);
     request.on('aborted', () => reject(new RequestError(400, 'Incomplete request')));
@@ -86,49 +94,73 @@ function cbor(response: ServerResponse, value: unknown): void {
   response.end(encode(value));
 }
 
-/** A disposable backend. Keys, values, and blobs remain opaque bytes. */
-export function createCacheServer({ maxRequestBytes = 64 * 1024 * 1024, basePath = '' } = {}) {
-  const entries = new Map<string, Entry>();
-  const associations = new Map<string, string>();
-  const blobs = new Map<string, Buffer>();
-  let nextBlobId = 1;
+/**
+ * A test backend that keeps its state in `directory`: entries and associations
+ * in `state.json`, and each blob in `blobs/` under its ID. Keys, values, and
+ * blobs remain opaque bytes. A fetch that matches neither key gets a plain-text
+ * 404. After each response, `logRequest` receives a line with the method, the
+ * route below `basePath`, the status, and for successful fetch responses, the
+ * kind.
+ */
+export function createCacheServer({
+  basePath,
+  directory,
+  logRequest,
+}: {
+  basePath: string;
+  directory: string;
+  logRequest: (line: string) => void;
+}) {
+  const stateFile = join(directory, 'state.json');
+  const blobDirectory = join(directory, 'blobs');
+  const state: State = existsSync(stateFile)
+    ? JSON.parse(readFileSync(stateFile, 'utf8'))
+    : { next_blob_id: 1, entries: {}, associations: {} };
+  const entries = new Map(Object.entries(state.entries));
+  const associations = new Map(Object.entries(state.associations));
+  let nextBlobId = state.next_blob_id;
 
-  async function handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
-    const path = new URL(request.url ?? '/', 'http://localhost').pathname;
+  /** Respond to `request`, returning the kind of a successful fetch response. */
+  async function handle(
+    request: IncomingMessage,
+    response: ServerResponse,
+    path: string,
+  ): Promise<string | undefined> {
     if (request.method === 'GET' && path.startsWith(`${basePath}/blob/`)) {
-      const blob = blobs.get(path.slice(`${basePath}/blob/`.length));
-      if (blob === undefined) throw new RequestError(404, 'Blob not found');
+      const file = join(blobDirectory, path.slice(`${basePath}/blob/`.length));
+      if (!existsSync(file)) throw new RequestError(404, 'Blob not found');
       response.writeHead(200, { 'content-type': 'application/octet-stream' });
-      response.end(blob);
-      return;
+      response.end(readFileSync(file));
+      return undefined;
     }
     if (request.method !== 'POST' || ![`${basePath}/fetch`, `${basePath}/store`].includes(path)) {
       throw new RequestError(404, 'Route not found');
     }
 
     const contentType = request.headers['content-type'] ?? '';
-    const body = await readBody(request, maxRequestBytes);
+    const body = await readBody(request);
     if (path === `${basePath}/fetch`) {
       if (mediaType(contentType) !== 'application/cbor') {
         throw new RequestError(400, 'Expected application/cbor');
       }
       const fields = byteFields(body, ['key', 'secondary_key']);
-      const key = Buffer.from(fields.get('key')!).toString('hex');
-      const secondary = Buffer.from(fields.get('secondary_key')!).toString('hex');
-      const entry = entries.get(key);
-      if (entry) {
-        cbor(response, { kind: 'exact', ...entry });
-      } else {
-        const associatedKey = associations.get(secondary);
-        if (associatedKey === undefined || !entries.has(associatedKey)) {
-          throw new RequestError(404, 'Entry not found');
-        }
+      const exact = entries.get(toHex(fields.get('key')!));
+      const associatedKey = associations.get(toHex(fields.get('secondary_key')!));
+      const fallback = associatedKey === undefined ? undefined : entries.get(associatedKey);
+      if (exact) {
+        cbor(response, { kind: 'exact', value: fromHex(exact.value), blob_id: exact.blob_id });
+        return 'exact';
+      }
+      if (fallback) {
         cbor(response, {
           kind: 'fallback',
-          key: new Uint8Array(Buffer.from(associatedKey, 'hex')),
+          key: fromHex(associatedKey!),
+          value: fromHex(fallback.value),
+          blob_id: fallback.blob_id,
         });
+        return 'fallback';
       }
-      return;
+      throw new RequestError(404, 'Not found');
     }
 
     if (mediaType(contentType) !== 'multipart/form-data') {
@@ -143,21 +175,30 @@ export function createCacheServer({ maxRequestBytes = 64 * 1024 * 1024, basePath
     const metadata = parts.get('metadata');
     if (metadata === undefined) throw new RequestError(400, 'Missing metadata');
     const fields = byteFields(metadata, ['key', 'secondary_key', 'value']);
-    const key = Buffer.from(fields.get('key')!).toString('hex');
-    const secondary = Buffer.from(fields.get('secondary_key')!).toString('hex');
+    const key = toHex(fields.get('key')!);
     const blob = parts.get('blob');
+    mkdirSync(blobDirectory, { recursive: true });
     const blobId = blob === undefined ? null : String(nextBlobId++);
-
-    // Publish only after the complete request is validated. There is no await
-    // between these writes, so concurrent stores cannot mix values and blobs.
-    if (blobId !== null) blobs.set(blobId, blob!);
-    entries.set(key, { value: fields.get('value')!, blob_id: blobId });
-    associations.set(secondary, key);
+    if (blobId !== null) writeFileSync(join(blobDirectory, blobId), blob!);
+    entries.set(key, { value: toHex(fields.get('value')!), blob_id: blobId });
+    associations.set(toHex(fields.get('secondary_key')!), key);
+    const saved: State = {
+      next_blob_id: nextBlobId,
+      entries: Object.fromEntries(entries),
+      associations: Object.fromEntries(associations),
+    };
+    writeFileSync(stateFile, `${JSON.stringify(saved, null, 2)}\n`);
     cbor(response, { blob_id: blobId });
+    return undefined;
   }
 
   return createServer((request, response) => {
-    void handle(request, response).catch((error: unknown) => {
+    const path = new URL(request.url ?? '/', 'http://localhost').pathname;
+    const log = (kind?: string) => {
+      const parts = [request.method, path.slice(basePath.length), response.statusCode, kind];
+      logRequest(parts.filter((part) => part !== undefined).join(' '));
+    };
+    void handle(request, response, path).then(log, (error: unknown) => {
       const known = error instanceof RequestError;
       if (!known) console.error(error);
       response.writeHead(known ? error.status : 500, {
@@ -165,6 +206,7 @@ export function createCacheServer({ maxRequestBytes = 64 * 1024 * 1024, basePath
       });
       response.end(known ? error.message : 'Internal server error');
       request.resume();
+      log();
     });
   });
 }

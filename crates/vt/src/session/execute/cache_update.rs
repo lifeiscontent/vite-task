@@ -4,6 +4,7 @@
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use rustc_hash::FxHashSet;
+use tokio_util::sync::CancellationToken;
 use vt_path::{AbsolutePath, RelativePathBuf};
 use vt_plan::cache_metadata::{CacheMetadata, EnvValueHash};
 use vt_server::Reports;
@@ -44,7 +45,8 @@ type TrackedEnvQueryValues = BTreeMap<TrackedEnvQuery, BTreeMap<Str, EnvValueHas
 /// Every outcome returns a `(status, error)` pair for the caller's single
 /// `finish()` call; this function never reports by itself. The guard clauses
 /// run in priority order — each names the reason the run is *not* cached, and
-/// only a run that passes them all is stored.
+/// only a run that passes them all is stored. A run cancelled by Ctrl-C or
+/// fast-fail (`cancel_token`) isn't cached.
 #[expect(
     clippy::too_many_arguments,
     reason = "the run's full context is genuinely needed to decide and store the cache entry"
@@ -57,7 +59,7 @@ pub(super) async fn update_cache(
     outcome: &ChildOutcome,
     reports: Option<&Reports>,
     duration: Duration,
-    cancelled: bool,
+    cancel_token: &CancellationToken,
 ) -> (CacheUpdateStatus, Option<ExecutionError>) {
     let CacheState { metadata, globbed_inputs, std_outputs, tracking } = state;
     let fspy = tracking.fspy.as_ref();
@@ -79,7 +81,7 @@ pub(super) async fn update_cache(
         .map(|r| normalize_ignored_paths(&r.ignored_outputs, workspace_root))
         .unwrap_or_default();
 
-    if cancelled {
+    if cancel_token.is_cancelled() {
         // Cancelled (Ctrl-C or sibling failure) — result is untrustworthy.
         return (CacheUpdateStatus::NotUpdated(CacheNotUpdatedReason::Cancelled), None);
     }
@@ -186,7 +188,7 @@ pub(super) async fn update_cache(
         output_archive,
     };
     match cache.update(metadata, new_cache_value, cache_dir).await {
-        Ok(()) => (CacheUpdateStatus::Updated, None),
+        Ok(upload_error) => (CacheUpdateStatus::Updated { upload_error }, None),
         Err(err) => (
             CacheUpdateStatus::NotUpdated(CacheNotUpdatedReason::CacheDisabled),
             Some(ExecutionError::Cache { kind: CacheErrorKind::Update, source: err }),
@@ -214,6 +216,10 @@ const fn fspy_missing_reason(outcome: &ChildOutcome) -> CacheNotUpdatedReason {
 /// user-configured input negatives, and by tool-reported `ignoreInput` paths.
 /// `path_writes` is filtered by user-configured output negatives and
 /// tool-reported `ignoreOutput` paths before read-write overlap detection.
+#[cfg_attr(
+    not(fspy),
+    expect(clippy::missing_const_for_fn, reason = "the body is a no-op without fspy")
+)]
 fn observe_fspy(
     #[cfg(fspy)] path_accesses: Option<&fspy::PathAccessIterable>,
     metadata: &CacheMetadata,
@@ -309,6 +315,7 @@ fn normalize_ignored_paths(
 
 /// Whether `path` is covered by any `ignored` entry. An ignored entry matches
 /// itself (exact file) and everything under it (directory subtree).
+#[cfg(fspy)]
 fn is_ignored(path: &RelativePathBuf, ignored: &FxHashSet<RelativePathBuf>) -> bool {
     if ignored.is_empty() {
         return false;
