@@ -1,0 +1,749 @@
+//! Client for the remote cache server API. Keys, values, and blobs are opaque
+//! bytes; the caller decides what they contain.
+
+pub mod auth;
+#[cfg(test)]
+mod test_server;
+
+use std::{sync::Arc, time::Duration};
+
+use bytes::Bytes;
+use reqwest::{
+    Response, StatusCode,
+    header::{CONTENT_TYPE, HeaderMap},
+    multipart::{Form, Part},
+};
+use serde::{Deserialize, Serialize};
+use url::{ParseError, Url};
+use vt_path::AbsolutePath;
+use vt_str::Str;
+
+use crate::auth::{Auth, AuthError, Operation};
+
+/// Time allowed to establish a connection, including the TLS handshake.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Time allowed for each read of a response. Until the response headers
+/// arrive, it also bounds sending the request.
+const READ_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// A failed remote cache operation. The messages name only the kind of
+/// failure, so they are the same on every platform. The details, if any, are
+/// in the source.
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    /// The endpoint isn't an HTTP or HTTPS URL that can have a path. The
+    /// source is the parse error if it isn't a URL at all.
+    #[error("invalid endpoint")]
+    InvalidEndpoint(#[source] Option<ParseError>),
+    /// The HTTP client couldn't be created, for example because no root
+    /// certificates could be loaded.
+    #[error("failed to create the HTTP client")]
+    HttpClient(#[source] reqwest::Error),
+    /// The blob file couldn't be opened.
+    #[error("failed to read the blob")]
+    ReadBlob(#[source] std::io::Error),
+    /// The request's credentials couldn't be obtained, so it wasn't sent.
+    /// The source says why.
+    #[error("failed to authenticate")]
+    Auth(#[source] AuthError),
+    /// No complete response arrived, for example because the connection
+    /// failed, timed out, or closed before the whole body arrived. The source
+    /// leaves out the request URL, because the endpoint may contain
+    /// credentials, such as a token in its query.
+    #[error("network error")]
+    Network(#[source] reqwest::Error),
+    /// The server responded with a status other than 200, or for a fetch,
+    /// other than 200 or 404. The source is the message in the response body,
+    /// if any.
+    #[error("HTTP status {}", .0.as_u16())]
+    Status(StatusCode, #[source] Option<ServerMessage>),
+    /// The body of a 200 fetch response isn't an exact or fallback match.
+    #[error("malformed response")]
+    MalformedResponse(#[source] ciborium::de::Error<std::io::Error>),
+}
+
+/// The message in the body of an error response.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct ServerMessage(Str);
+
+/// A blob being downloaded.
+#[derive(Debug)]
+pub struct Download {
+    response: Response,
+}
+
+impl Download {
+    /// The next chunk of the blob, or `None` after the last one.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the rest of the blob can't be read, for example
+    /// because the connection closes before it all arrives.
+    pub async fn chunk(&mut self) -> Result<Option<Bytes>, Error> {
+        self.response.chunk().await.map_err(network_error)
+    }
+}
+
+/// The `metadata` part of a store request.
+#[derive(Serialize)]
+struct StoreMetadata<'a> {
+    #[serde(with = "serde_bytes")]
+    key: &'a [u8],
+    #[serde(with = "serde_bytes")]
+    secondary_key: &'a [u8],
+    #[serde(with = "serde_bytes")]
+    value: &'a [u8],
+}
+
+/// The keys a fetch looks up.
+#[derive(Serialize)]
+struct FetchRequest<'a> {
+    #[serde(with = "serde_bytes")]
+    key: &'a [u8],
+    #[serde(with = "serde_bytes")]
+    secondary_key: &'a [u8],
+}
+
+/// The body of a 200 fetch response: an exact or fallback match.
+#[derive(Debug, PartialEq, Eq, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Fetched {
+    /// The entry stored under the requested key.
+    Exact {
+        /// The stored value.
+        #[serde(with = "serde_bytes")]
+        value: Vec<u8>,
+        /// The ID to download the entry's blob with, if it has one. The field
+        /// must be present, with null for no blob.
+        #[serde(deserialize_with = "Option::deserialize")]
+        blob_id: Option<Str>,
+    },
+    /// No entry is stored under the requested key, but the secondary key is
+    /// associated with the entry stored under `key`. The fallback entry's
+    /// value and blob ID aren't decoded.
+    Fallback {
+        /// The key the fallback entry is stored under.
+        #[serde(with = "serde_bytes")]
+        key: Vec<u8>,
+    },
+}
+
+/// A client for one remote cache endpoint.
+#[derive(Debug)]
+pub struct Client {
+    http: reqwest::Client,
+    auth: Arc<dyn Auth>,
+    fetch_url: Url,
+    store_url: Url,
+    /// `{endpoint}/blob`, to which each download appends a blob ID.
+    blob_url: Url,
+}
+
+impl Client {
+    /// Create a client for `endpoint`, a base URL that may include a
+    /// namespace path, such as `https://cache.example.com/projects/my-project`.
+    /// Each request carries the headers that `auth` supplies for it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidEndpoint`] if `endpoint` isn't a usable URL, or
+    /// [`Error::HttpClient`] if the HTTP client can't be created.
+    pub fn new(endpoint: &str, auth: Arc<dyn Auth>) -> Result<Self, Error> {
+        let endpoint = parse_endpoint(endpoint)?;
+        let fetch_url = route_url(&endpoint, "fetch")?;
+        let store_url = route_url(&endpoint, "store")?;
+        let blob_url = route_url(&endpoint, "blob")?;
+        // reqwest configures TLS with the process's default crypto provider.
+        // Installing fails if one is already installed; vite-plus installs
+        // ring too.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        // A redirect fails like any other status. Following one could turn a
+        // store into a GET of a login page that responds with 200. HTTPS
+        // endpoints use HTTP/2 if the server accepts it in the TLS handshake.
+        let http = reqwest::Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .read_timeout(READ_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(Error::HttpClient)?;
+        Ok(Self { http, auth, fetch_url, store_url, blob_url })
+    }
+
+    async fn auth_headers(&self, operation: Operation) -> Result<HeaderMap, Error> {
+        self.auth.headers(operation, &self.http).await.map_err(Error::Auth)
+    }
+
+    /// Fetch the entry stored under `key` with `POST {endpoint}/fetch`,
+    /// falling back to the entry associated with `secondary_key`. Returns
+    /// `None` for a 404 response, which means neither key matched.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the credentials can't be obtained, the request
+    /// fails, the server responds with a status other than 200 or 404, or the
+    /// body of a 200 response isn't an exact or fallback match.
+    pub async fn fetch(&self, key: &[u8], secondary_key: &[u8]) -> Result<Option<Fetched>, Error> {
+        let headers = self.auth_headers(Operation::Fetch).await?;
+        let body = encode_cbor(&FetchRequest { key, secondary_key });
+        let response = self
+            .http
+            .post(self.fetch_url.clone())
+            .headers(headers)
+            .header(CONTENT_TYPE, "application/cbor")
+            .body(body)
+            .send()
+            .await
+            .map_err(network_error)?;
+        if response.status() == StatusCode::NOT_FOUND {
+            // Read the body so the connection can be reused. It doesn't matter
+            // if that fails, because the status alone is the answer.
+            let _ = response.bytes().await;
+            return Ok(None);
+        }
+        let body = check_status(response).await?.bytes().await.map_err(network_error)?;
+        decode_fetched(&body).map(Some)
+    }
+
+    /// Start downloading the blob `blob_id` with
+    /// `GET {endpoint}/blob/{blob_id}`. Its chunks are read from the returned
+    /// [`Download`] as they arrive.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the credentials can't be obtained, the request
+    /// fails, or the server responds with a status other than 200.
+    pub async fn download(&self, blob_id: &str) -> Result<Download, Error> {
+        let mut url = self.blob_url.clone();
+        url.path_segments_mut().map_err(|()| Error::InvalidEndpoint(None))?.push(blob_id);
+        let headers = self.auth_headers(Operation::Download).await?;
+        let response = self.http.get(url).headers(headers).send().await.map_err(network_error)?;
+        Ok(Download { response: check_status(response).await? })
+    }
+
+    /// Store `value` under `key` with `POST {endpoint}/store`, uploading the
+    /// file at `blob` as its blob. Fetches that match no key fall back to this
+    /// entry through `secondary_key`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the credentials can't be obtained, the blob file
+    /// can't be opened, the request fails, or the server responds with a
+    /// status other than 200.
+    pub async fn store(
+        &self,
+        key: &[u8],
+        secondary_key: &[u8],
+        value: &[u8],
+        blob: Option<&AbsolutePath>,
+    ) -> Result<(), Error> {
+        let headers = self.auth_headers(Operation::Store).await?;
+        let metadata = StoreMetadata { key, secondary_key, value };
+        let mut form = Form::new().part("metadata", metadata_part(&metadata));
+        if let Some(blob) = blob {
+            form = form.part("blob", blob_part(blob).await?);
+        }
+        let response = self
+            .http
+            .post(self.store_url.clone())
+            .headers(headers)
+            .multipart(form)
+            .send()
+            .await
+            .map_err(network_error)?;
+        // The response's blob ID isn't needed. Read the body anyway, so the
+        // connection can be reused.
+        check_status(response).await?.bytes().await.map_err(network_error)?;
+        Ok(())
+    }
+}
+
+/// Only HTTP 200 counts as success. For other statuses, the error includes the
+/// message in the response body.
+async fn check_status(response: Response) -> Result<Response, Error> {
+    let status = response.status();
+    if status == StatusCode::OK {
+        return Ok(response);
+    }
+    let message = response.text().await.ok().and_then(|text| {
+        let text = text.trim();
+        (!text.is_empty()).then(|| ServerMessage(Str::from(text)))
+    });
+    Err(Error::Status(status, message))
+}
+
+fn network_error(err: reqwest::Error) -> Error {
+    Error::Network(err.without_url())
+}
+
+fn decode_fetched(body: &[u8]) -> Result<Fetched, Error> {
+    ciborium::from_reader(body).map_err(Error::MalformedResponse)
+}
+
+fn parse_endpoint(endpoint: &str) -> Result<Url, Error> {
+    let url = Url::parse(endpoint).map_err(|err| Error::InvalidEndpoint(Some(err)))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(Error::InvalidEndpoint(None));
+    }
+    Ok(url)
+}
+
+/// Append `route` to the endpoint's path, keeping its namespace path.
+fn route_url(endpoint: &Url, route: &str) -> Result<Url, Error> {
+    let mut url = endpoint.clone();
+    url.path_segments_mut().map_err(|()| Error::InvalidEndpoint(None))?.pop_if_empty().push(route);
+    Ok(url)
+}
+
+fn encode_cbor(value: &impl Serialize) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    ciborium::into_writer(value, &mut bytes).expect("encoding byte strings into a Vec can't fail");
+    bytes
+}
+
+fn metadata_part(metadata: &StoreMetadata<'_>) -> Part {
+    Part::bytes(encode_cbor(metadata)).mime_str("application/cbor").expect("valid MIME type")
+}
+
+async fn blob_part(path: &AbsolutePath) -> Result<Part, Error> {
+    let file = tokio::fs::File::open(path).await.map_err(Error::ReadBlob)?;
+    let length = file.metadata().await.map_err(Error::ReadBlob)?.len();
+    Ok(Part::stream_with_length(file, length)
+        .mime_str("application/octet-stream")
+        .expect("valid MIME type"))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{io::Read as _, net::TcpListener};
+
+    use reqwest::header::{HeaderName, HeaderValue};
+    use vt_path::AbsolutePathBuf;
+
+    use super::*;
+    use crate::{
+        auth::{Anonymous, AuthHeaders},
+        test_server::{contains, no_request_waiting, serve_once, serve_raw_once},
+    };
+
+    fn store_url(endpoint: &str) -> Result<Url, Error> {
+        route_url(&parse_endpoint(endpoint)?, "store")
+    }
+
+    #[test]
+    fn store_url_keeps_the_namespace_path() {
+        for (endpoint, expected) in [
+            ("http://cache.example/projects/test", "http://cache.example/projects/test/store"),
+            ("http://cache.example/projects/test/", "http://cache.example/projects/test/store"),
+            ("https://cache.example", "https://cache.example/store"),
+            ("https://cache.example/ns?token=a", "https://cache.example/ns/store?token=a"),
+        ] {
+            assert_eq!(store_url(endpoint).unwrap().as_str(), expected, "{endpoint}");
+        }
+    }
+
+    #[test]
+    fn rejects_endpoints_that_are_not_http_urls() {
+        for endpoint in ["cache.example/projects/test", "ftp://cache.example", "mailto:a@b.example"]
+        {
+            let client = Client::new(endpoint, Arc::new(Anonymous));
+            assert!(matches!(client, Err(Error::InvalidEndpoint(_))), "{endpoint}");
+        }
+    }
+
+    #[test]
+    fn metadata_is_a_cbor_map_of_byte_strings() {
+        let metadata = StoreMetadata { key: b"k", secondary_key: b"", value: &[0x00, 0xff] };
+        let mut expected = vec![0xa3];
+        expected.extend(b"\x63key\x41k");
+        expected.extend(b"\x6dsecondary_key\x40");
+        expected.extend(b"\x65value\x42\x00\xff");
+        assert_eq!(encode_cbor(&metadata), expected);
+    }
+
+    fn cbor_map(fields: Vec<(&str, ciborium::Value)>) -> Vec<u8> {
+        let map = fields.into_iter().map(|(name, value)| (name.into(), value)).collect();
+        encode_cbor(&ciborium::Value::Map(map))
+    }
+
+    #[test]
+    fn decodes_each_kind_of_fetch_response() {
+        let bytes = |bytes: &[u8]| ciborium::Value::Bytes(bytes.to_vec());
+        let exact = cbor_map(vec![
+            ("kind", "exact".into()),
+            ("value", bytes(b"\x00value")),
+            ("blob_id", "1".into()),
+        ]);
+        assert_eq!(
+            decode_fetched(&exact).unwrap(),
+            Fetched::Exact { value: b"\x00value".to_vec(), blob_id: Some(Str::from("1")) }
+        );
+
+        let without_blob = cbor_map(vec![
+            ("kind", "exact".into()),
+            ("value", bytes(b"value")),
+            ("blob_id", ciborium::Value::Null),
+        ]);
+        assert_eq!(
+            decode_fetched(&without_blob).unwrap(),
+            Fetched::Exact { value: b"value".to_vec(), blob_id: None }
+        );
+
+        let fallback = cbor_map(vec![
+            ("kind", "fallback".into()),
+            ("key", bytes(b"stored key")),
+            ("value", bytes(b"value")),
+            ("blob_id", "2".into()),
+        ]);
+        assert_eq!(
+            decode_fetched(&fallback).unwrap(),
+            Fetched::Fallback { key: b"stored key".to_vec() }
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_fetch_responses() {
+        for body in [
+            b"\xffnot cbor".to_vec(),
+            cbor_map(vec![("kind", "unknown".into())]),
+            // A miss is a 404 response, not a kind.
+            cbor_map(vec![("kind", "not_found".into())]),
+            // The value must be a byte string.
+            cbor_map(vec![
+                ("kind", "exact".into()),
+                ("value", 1.into()),
+                ("blob_id", ciborium::Value::Null),
+            ]),
+            // `blob_id` is nullable, but it must be present.
+            cbor_map(vec![
+                ("kind", "exact".into()),
+                ("value", ciborium::Value::Bytes(b"value".to_vec())),
+            ]),
+        ] {
+            let error = decode_fetched(&body).unwrap_err();
+            assert!(matches!(error, Error::MalformedResponse(_)), "{error:?}");
+            assert_eq!(error.to_string(), "malformed response");
+        }
+    }
+
+    fn client_for(listener: &TcpListener) -> Client {
+        client_with_auth(listener, Arc::new(Anonymous))
+    }
+
+    fn client_with_auth(listener: &TcpListener, auth: Arc<dyn Auth>) -> Client {
+        let port = listener.local_addr().unwrap().port();
+        Client::new(&vt_str::format!("http://127.0.0.1:{port}/projects/test"), auth).unwrap()
+    }
+
+    /// The `metadata` part of a store request for key `k`, secondary key `s`,
+    /// and value `v`.
+    fn metadata_part_bytes() -> Vec<u8> {
+        let metadata = StoreMetadata { key: b"k", secondary_key: b"s", value: b"v" };
+        [
+            b"name=\"metadata\"\r\nContent-Type: application/cbor\r\n\r\n".as_slice(),
+            &encode_cbor(&metadata),
+            b"\r\n",
+        ]
+        .concat()
+    }
+
+    #[tokio::test]
+    async fn fetch_posts_the_keys_as_cbor() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = client_for(&listener);
+        let body = cbor_map(vec![
+            ("kind", "exact".into()),
+            ("value", ciborium::Value::Bytes(b"v".to_vec())),
+            ("blob_id", ciborium::Value::Null),
+        ]);
+        let server = std::thread::spawn(move || serve_once(&listener, "HTTP/1.1 200 OK", &body));
+
+        assert_eq!(
+            client.fetch(b"k", b"s").await.unwrap(),
+            Some(Fetched::Exact { value: b"v".to_vec(), blob_id: None })
+        );
+
+        let request = server.join().unwrap();
+        assert!(request.starts_with(b"POST /projects/test/fetch HTTP/1.1\r\n"));
+        assert!(contains(&request, b"content-type: application/cbor\r\n"));
+        let keys = encode_cbor(&FetchRequest { key: b"k", secondary_key: b"s" });
+        assert!(request.ends_with(&[b"\r\n\r\n".as_slice(), &keys].concat()));
+    }
+
+    #[tokio::test]
+    async fn fetch_of_a_missing_entry_is_none() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = client_for(&listener);
+        let server = std::thread::spawn(move || {
+            serve_once(&listener, "HTTP/1.1 404 Not Found", b"Not found")
+        });
+
+        assert_eq!(client.fetch(b"k", b"s").await.unwrap(), None);
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn fetch_ignores_an_incomplete_404_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = client_for(&listener);
+        // The connection closes before the announced length arrives.
+        let server = std::thread::spawn(move || {
+            serve_raw_once(&listener, b"HTTP/1.1 404 Not Found\r\ncontent-length: 100\r\n\r\nNot")
+        });
+
+        assert_eq!(client.fetch(b"k", b"s").await.unwrap(), None);
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn fetch_fails_on_an_error_status() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = client_for(&listener);
+        let server = std::thread::spawn(move || {
+            serve_once(&listener, "HTTP/1.1 503 Service Unavailable", b"try later")
+        });
+
+        let error = client.fetch(b"k", b"s").await.unwrap_err();
+        assert!(matches!(error, Error::Status(StatusCode::SERVICE_UNAVAILABLE, _)), "{error:?}");
+        assert_eq!(std::error::Error::source(&error).unwrap().to_string(), "try later");
+        server.join().unwrap();
+    }
+
+    async fn read_to_end(mut download: Download) -> Result<Vec<u8>, Error> {
+        let mut blob = Vec::new();
+        while let Some(chunk) = download.chunk().await? {
+            blob.extend_from_slice(&chunk);
+        }
+        Ok(blob)
+    }
+
+    #[tokio::test]
+    async fn download_streams_the_blob() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = client_for(&listener);
+        let server =
+            std::thread::spawn(move || serve_once(&listener, "HTTP/1.1 200 OK", b"archive bytes"));
+
+        let download = client.download("7").await.unwrap();
+        assert_eq!(read_to_end(download).await.unwrap(), b"archive bytes");
+
+        let request = server.join().unwrap();
+        assert!(request.starts_with(b"GET /projects/test/blob/7 HTTP/1.1\r\n"));
+    }
+
+    #[tokio::test]
+    async fn download_of_a_missing_blob_fails() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = client_for(&listener);
+        let server = std::thread::spawn(move || {
+            serve_once(&listener, "HTTP/1.1 404 Not Found", b"Blob not found")
+        });
+
+        let error = client.download("7").await.unwrap_err();
+        assert_eq!(error.to_string(), "HTTP status 404");
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn incomplete_download_is_a_network_error() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = client_for(&listener);
+        // The connection closes before the announced length arrives.
+        let server = std::thread::spawn(move || {
+            serve_raw_once(&listener, b"HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\npartial")
+        });
+
+        let download = client.download("7").await.unwrap();
+        let error = read_to_end(download).await.unwrap_err();
+        assert!(matches!(error, Error::Network(_)), "{error:?}");
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn store_posts_metadata_and_blob_parts() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob = AbsolutePathBuf::new(dir.path().join("archive.tar.zst")).unwrap();
+        std::fs::write(blob.as_path(), b"archive bytes").unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = client_for(&listener);
+        let server = std::thread::spawn(move || {
+            serve_once(&listener, "HTTP/1.1 500 Internal Server Error", b"storage failed\n")
+        });
+
+        let err = client.store(b"k", b"s", b"v", Some(&blob)).await.unwrap_err();
+        assert!(matches!(err, Error::Status(StatusCode::INTERNAL_SERVER_ERROR, _)));
+        assert_eq!(err.to_string(), "HTTP status 500");
+        assert_eq!(std::error::Error::source(&err).unwrap().to_string(), "storage failed");
+
+        let request = server.join().unwrap();
+        assert!(request.starts_with(b"POST /projects/test/store HTTP/1.1\r\n"));
+        assert!(contains(&request, b"content-type: multipart/form-data; boundary="));
+        assert!(contains(&request, &metadata_part_bytes()));
+        let blob =
+            b"name=\"blob\"\r\nContent-Type: application/octet-stream\r\n\r\narchive bytes\r\n";
+        assert!(contains(&request, blob));
+    }
+
+    #[tokio::test]
+    async fn store_without_a_blob_sends_only_metadata() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = client_for(&listener);
+        // `0xff` can't start a CBOR item, so this body doesn't decode.
+        let server =
+            std::thread::spawn(move || serve_once(&listener, "HTTP/1.1 200 OK", b"\xffnot cbor"));
+
+        client.store(b"k", b"s", b"v", None).await.unwrap();
+
+        let request = server.join().unwrap();
+        assert!(request.starts_with(b"POST /projects/test/store HTTP/1.1\r\n"));
+        assert!(contains(&request, &metadata_part_bytes()));
+        assert!(!contains(&request, b"name=\"blob\""));
+    }
+
+    #[tokio::test]
+    async fn store_does_not_follow_redirects() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = client_for(&listener);
+        let server = std::thread::spawn(move || {
+            serve_raw_once(
+                &listener,
+                b"HTTP/1.1 302 Found\r\nlocation: /login\r\ncontent-length: 0\r\n\r\n",
+            )
+        });
+
+        let error = client.store(b"k", b"s", b"v", None).await.unwrap_err();
+        assert!(matches!(error, Error::Status(StatusCode::FOUND, None)), "{error:?}");
+        server.join().unwrap();
+    }
+
+    /// Adds an `x-operation` header that names the request's operation.
+    #[derive(Debug)]
+    struct NamesOperation;
+
+    impl Auth for NamesOperation {
+        fn headers<'a>(&'a self, operation: Operation, _: &'a reqwest::Client) -> AuthHeaders<'a> {
+            let name = match operation {
+                Operation::Fetch => "fetch",
+                Operation::Download => "download",
+                Operation::Store => "store",
+            };
+            let headers = HeaderMap::from_iter([(
+                HeaderName::from_static("x-operation"),
+                HeaderValue::from_static(name),
+            )]);
+            Box::pin(std::future::ready(Ok(headers)))
+        }
+    }
+
+    /// Run `send` with a client whose requests carry the headers from `auth`,
+    /// and return the request it sent. The server responds with 404.
+    async fn request_with_auth<F: Future<Output = ()>>(
+        auth: Arc<dyn Auth>,
+        send: impl FnOnce(Client) -> F,
+    ) -> Vec<u8> {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = client_with_auth(&listener, auth);
+        let server =
+            std::thread::spawn(move || serve_once(&listener, "HTTP/1.1 404 Not Found", b""));
+        send(client).await;
+        server.join().unwrap()
+    }
+
+    #[tokio::test]
+    async fn each_request_carries_the_auth_headers_for_its_operation() {
+        let auth: Arc<dyn Auth> = Arc::new(NamesOperation);
+        let fetch = request_with_auth(Arc::clone(&auth), |client| async move {
+            assert_eq!(client.fetch(b"k", b"s").await.unwrap(), None);
+        })
+        .await;
+        assert!(contains(&fetch, b"x-operation: fetch\r\n"));
+
+        let download = request_with_auth(Arc::clone(&auth), |client| async move {
+            client.download("7").await.unwrap_err();
+        })
+        .await;
+        assert!(contains(&download, b"x-operation: download\r\n"));
+
+        let store = request_with_auth(auth, |client| async move {
+            client.store(b"k", b"s", b"v", None).await.unwrap_err();
+        })
+        .await;
+        assert!(contains(&store, b"x-operation: store\r\n"));
+    }
+
+    /// Fails to supply credentials for every request.
+    #[derive(Debug)]
+    struct Unavailable;
+
+    impl Auth for Unavailable {
+        fn headers<'a>(&'a self, _: Operation, _: &'a reqwest::Client) -> AuthHeaders<'a> {
+            let error: AuthError = Arc::new(std::io::Error::other("no credentials"));
+            Box::pin(std::future::ready(Err(error)))
+        }
+    }
+
+    #[tokio::test]
+    async fn requests_without_credentials_are_not_sent() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = client_with_auth(&listener, Arc::new(Unavailable));
+
+        let errors = [
+            client.fetch(b"k", b"s").await.unwrap_err(),
+            client.download("7").await.unwrap_err(),
+            client.store(b"k", b"s", b"v", None).await.unwrap_err(),
+        ];
+        for error in errors {
+            assert!(matches!(error, Error::Auth(_)), "{error:?}");
+            assert_eq!(error.to_string(), "failed to authenticate");
+            assert_eq!(std::error::Error::source(&error).unwrap().to_string(), "no credentials");
+        }
+        assert!(no_request_waiting(&listener));
+    }
+
+    /// Accept one connection and return the TLS record it starts with, which
+    /// is the `ClientHello`, then close the connection without responding.
+    fn read_client_hello(listener: &TcpListener) -> Vec<u8> {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut record = vec![0; 5];
+        stream.read_exact(&mut record).unwrap();
+        assert_eq!(record[0], 0x16, "not a TLS handshake record");
+        let length = usize::from(u16::from_be_bytes([record[3], record[4]]));
+        record.resize(5 + length, 0);
+        stream.read_exact(&mut record[5..]).unwrap();
+        record
+    }
+
+    #[tokio::test]
+    async fn offers_http2_over_tls() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let client = Client::new(
+            &vt_str::format!("https://127.0.0.1:{port}/projects/test"),
+            Arc::new(Anonymous),
+        )
+        .unwrap();
+        let server = std::thread::spawn(move || read_client_hello(&listener));
+
+        let error = client.fetch(b"k", b"s").await.unwrap_err();
+        assert!(matches!(error, Error::Network(_)), "{error:?}");
+
+        // The ALPN extension lists h2, then http/1.1.
+        assert!(contains(&server.join().unwrap(), b"\x02h2\x08http/1.1"));
+    }
+
+    #[tokio::test]
+    async fn network_errors_leave_out_the_url() {
+        let endpoint = "http://user:password@127.0.0.1:0/projects/test?token=secret";
+        let client = Client::new(endpoint, Arc::new(Anonymous)).unwrap();
+
+        let error = client.fetch(b"k", b"s").await.unwrap_err();
+        assert!(matches!(error, Error::Network(_)), "{error:?}");
+        let messages =
+            std::iter::successors(Some(&error as &dyn std::error::Error), |err| err.source())
+                .map(|err| vt_str::format!("{err}"));
+        for text in messages.chain([vt_str::format!("{error:?}")]) {
+            assert!(!text.contains("password") && !text.contains("secret"), "{text}");
+        }
+    }
+}

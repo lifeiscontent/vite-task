@@ -12,7 +12,7 @@ use std::{ffi::OsStr, fmt::Debug, os::unix::ffi::OsStrExt as _, path::Path};
 
 use allocator_api2::alloc::Allocator;
 use convert::{ToAbsolutePath, ToAccessMode};
-use fspy_shared::ipc::{PathAccess, channel::Sender};
+use fspy_shared::ipc::{AccessMode, channel::Sender};
 use fspy_shared_unix::{
     exec::ExecResolveConfig,
     payload::{EncodedPayload, decode_payload_from_env},
@@ -96,7 +96,7 @@ impl<'a> Client<'a> {
         Self { encoded_payload, ipc_sender }
     }
 
-    fn send(&self, mode: fspy_shared::ipc::AccessMode, path: &Path) {
+    fn send(&self, mode: AccessMode, path: &Path) {
         let Some(ipc_sender) = &self.ipc_sender else {
             return;
         };
@@ -109,7 +109,7 @@ impl<'a> Client<'a> {
         }
         // The interception proceeds whether or not the record could be
         // sent — a preload library can never panic its host process.
-        ipc_sender.send(&PathAccess { mode, path: path.into() });
+        ipc_sender.send(&mode.with_path(path.into()));
     }
 
     /// Marks the run's trace incomplete, so the receiver treats it as
@@ -153,8 +153,8 @@ impl<'a> Client<'a> {
         // SAFETY: raw_exec contains valid pointers to C strings and
         // null-terminated arrays, as provided by the caller.
         let mut exec = unsafe { raw_exec.to_exec() };
-        resolve_exec(&mut exec, config, |mode, path| {
-            self.send(mode, path);
+        resolve_exec(&mut exec, config, |path| {
+            self.send(AccessMode::Read, path);
         })
         .map_err(ExecInjectionError::Resolution)?;
         let pre_exec = prepare_exec(&mut exec, &self.encoded_payload)
