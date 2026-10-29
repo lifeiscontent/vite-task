@@ -125,44 +125,41 @@ impl<'a> Client<'a> {
         }
     }
 
-    /// Resolves and reports an exec before forwarding its transformed arguments.
+    /// Resolves and reports an exec, returning the transformed arguments to
+    /// forward and what to run before forwarding them.
     ///
-    /// The callback contract: capture the real exec's own outcome (return
-    /// value, errno) into `R` and return it as `Ok`, even when the exec
-    /// itself fails. Reserve `Err` for injection machinery failures, such as
-    /// [`PreExec::run`] failing to install the seccomp filter — the caller
-    /// maps those to [`ExecInjectionError::Injection`], marks the trace
+    /// A failure of the returned [`PreExec::run`], such as failing to install
+    /// the seccomp filter, is an injection machinery failure too: the caller
+    /// treats it like [`ExecInjectionError::Injection`], marks the trace
     /// incomplete, and retries the operation untracked.
     ///
     /// # Safety
     ///
     /// `raw_exec` must contain the valid C strings and pointer arrays required
-    /// by [`RawExec::to_exec`]. The callback must not retain pointers from the
-    /// transformed `RawExec` after it returns.
+    /// by [`RawExec::to_exec`]. The returned `RawExec` points into
+    /// `allocator`, and must not be used after `allocator` is dropped.
     ///
     /// # Errors
     ///
     /// [`ExecInjectionError::Resolution`] when program resolution fails the
     /// way the real exec would have; [`ExecInjectionError::Injection`] when
     /// the injection machinery fails after the program resolved.
-    pub unsafe fn handle_exec<R>(
+    pub unsafe fn handle_exec<A: Allocator>(
         &self,
         config: ExecResolveConfig,
         raw_exec: RawExec,
-        allocator: impl Allocator,
-        f: impl FnOnce(RawExec, Option<PreExec>) -> nix::Result<R>,
-    ) -> Result<R, ExecInjectionError> {
+        allocator: &A,
+    ) -> Result<(RawExec, Option<PreExec>), ExecInjectionError> {
         // SAFETY: raw_exec contains valid pointers to C strings and
         // null-terminated arrays, as provided by the caller.
-        let mut exec = unsafe { raw_exec.to_exec() };
+        let mut exec = unsafe { raw_exec.to_exec(allocator) };
         resolve_exec(&mut exec, config, |path| {
             self.send(AccessMode::Read, path);
         })
         .map_err(ExecInjectionError::Resolution)?;
         let pre_exec = prepare_exec(&mut exec, &self.encoded_payload)
             .map_err(ExecInjectionError::Injection)?;
-        RawExec::from_exec(exec, allocator, |raw_command| f(raw_command, pre_exec))
-            .map_err(ExecInjectionError::Injection)
+        Ok((RawExec::from_exec(exec), pre_exec))
     }
 
     /// Resolves and reports one intercepted file access.

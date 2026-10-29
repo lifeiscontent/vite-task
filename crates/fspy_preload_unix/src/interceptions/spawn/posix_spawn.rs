@@ -48,58 +48,60 @@ unsafe fn handle_posix_spawn(
         return unsafe { original(pid, file, file_actions, attrp, argv, envp) };
     };
 
+    let arena = fspy_nostd_alloc::pooled_bump();
     // SAFETY: file, argv, and envp are valid pointers forwarded from the interposed posix_spawn(p) function
-    let result = unsafe {
-        client.handle_exec::<c_int>(
+    let handled = unsafe {
+        client.handle_exec(
             config,
             RawExec { prog: file, argv: argv.cast(), envp: envp.cast() },
-            fspy_nostd_alloc::pooled_bump(),
-            |raw_command, pre_exec| {
-                let call_original = move || {
-                    original(
-                        pid,
-                        raw_command.prog,
-                        file_actions,
-                        attrp,
-                        raw_command.argv.cast(),
-                        raw_command.envp.cast(),
-                    )
-                };
-                if let Some(pre_exec) = pre_exec {
-                    thread::scope(move |s| {
-                        let call_original = AssertSend(call_original);
-                        s.spawn(move || {
-                            let call_original = call_original;
-                            pre_exec.run()?;
-
-                            nix::Result::Ok((call_original.0)())
-                        })
-                        .join()
-                        .unwrap()
-                    })
-                } else {
-                    Ok(call_original())
-                }
-            },
+            &arena,
         )
     };
-    match result {
-        Ok(ret) => ret,
-        Err(ExecInjectionError::Resolution(errno)) => {
-            // Resolution failed the way the real spawn would have;
-            // posix_spawn returns the errno code rather than -1.
-            errno as _
+    // The injection machinery failed. Mark the run's trace incomplete so it
+    // is not cached, then spawn untracked with the original arguments.
+    let spawn_untracked = || {
+        client.report_loss();
+        // SAFETY: all arguments are the interposed posix_spawn(p) function's
+        // own valid arguments.
+        unsafe { original(pid, file, file_actions, attrp, argv, envp) }
+    };
+    let (raw_command, pre_exec) = match handled {
+        Ok(handled) => handled,
+        // Resolution failed the way the real spawn would have; posix_spawn
+        // returns the errno code rather than -1.
+        Err(ExecInjectionError::Resolution(errno)) => return errno as _,
+        Err(ExecInjectionError::Injection(_)) => return spawn_untracked(),
+    };
+    let call_original = move || {
+        // SAFETY: the caller's pointers are forwarded unchanged, and raw_command's
+        // strings and arrays live in `arena`, which outlives the call
+        unsafe {
+            original(
+                pid,
+                raw_command.prog,
+                file_actions,
+                attrp,
+                raw_command.argv.cast(),
+                raw_command.envp.cast(),
+            )
         }
-        Err(ExecInjectionError::Injection(_)) => {
-            // The injection machinery failed. Mark the run's trace incomplete
-            // so it is not cached, then spawn untracked with the original
-            // arguments.
-            client.report_loss();
-            // SAFETY: all arguments are the interposed posix_spawn(p)
-            // function's own valid arguments.
-            unsafe { original(pid, file, file_actions, attrp, argv, envp) }
-        }
-    }
+    };
+    let Some(pre_exec) = pre_exec else {
+        return call_original();
+    };
+    thread::scope(move |s| {
+        let call_original = AssertSend(call_original);
+        s.spawn(move || {
+            let call_original = call_original;
+            pre_exec.run()?;
+
+            nix::Result::Ok((call_original.0)())
+        })
+        .join()
+        .unwrap()
+    })
+    // `pre_exec.run` failed, so the spawn never happened.
+    .unwrap_or_else(|_| spawn_untracked())
 }
 
 intercept!(posix_spawnp(64): PosixSpawnFn);
